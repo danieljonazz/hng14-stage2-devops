@@ -1,0 +1,155 @@
+version: "3.9"
+
+# ============================================================
+# NETWORKS
+# This creates a private internal network called "appnet".
+# All containers on this network can talk to each other
+# using their SERVICE NAME as the hostname.
+# e.g. the API reaches Redis by calling "redis:6379" —
+# Docker handles the DNS resolution automatically.
+# Containers NOT on this network can't reach them at all.
+# ============================================================
+networks:
+  appnet:
+    driver: bridge
+
+# ============================================================
+# SERVICES
+# Each "service" is one container. Docker Compose will build
+# and run all of them together.
+# ============================================================
+services:
+
+  # ----------------------------------------------------------
+  # REDIS
+  # We use the official Redis image — no Dockerfile needed.
+  # Redis starts first because everyone else depends on it.
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    networks:
+      - appnet
+    # NO "ports:" section here intentionally.
+    # Redis should NEVER be exposed to the outside world.
+    # It's an internal service — only the API and worker
+    # need to reach it, and they can via "appnet".
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      # redis-cli ping returns "PONG" if Redis is alive.
+      # Exit 0 = healthy, anything else = unhealthy.
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"       # can use at most half a CPU core
+          memory: 128M      # can use at most 128MB of RAM
+    # Why resource limits? Without them, one misbehaving service
+    # can eat all your server's memory and crash everything else.
+    # Limits keep each service in its lane.
+
+  # ----------------------------------------------------------
+  # API (Python/FastAPI)
+  # Builds from ./api/Dockerfile
+  # Starts after Redis is confirmed healthy
+  # ----------------------------------------------------------
+  api:
+    build: ./api
+    # "build: ./api" tells Compose to look for a Dockerfile
+    # inside the ./api folder and build the image from it.
+    networks:
+      - appnet
+    environment:
+      # All config comes from environment variables.
+      # The ${VAR} syntax reads from your .env file.
+      # Nothing is hardcoded here — this is the correct approach.
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    depends_on:
+      redis:
+        condition: service_healthy
+    # condition: service_healthy means "don't start the API
+    # until Redis has PASSED its healthcheck".
+    # Plain "depends_on: redis" only waits for Redis to START,
+    # not for it to be actually ready. That causes race conditions
+    # where the API crashes because Redis isn't accepting connections yet.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  # ----------------------------------------------------------
+  # WORKER (Python)
+  # Builds from ./worker/Dockerfile
+  # Starts after Redis is confirmed healthy
+  # ----------------------------------------------------------
+  worker:
+    build: ./worker
+    networks:
+      - appnet
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    depends_on:
+      redis:
+        condition: service_healthy
+    # The worker doesn't depend on the API — it only needs Redis.
+    # It reads jobs from Redis directly, independent of the API.
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "python worker.py"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  # ----------------------------------------------------------
+  # FRONTEND (Node.js/Express)
+  # Builds from ./frontend/Dockerfile
+  # Starts LAST — only after the API is confirmed healthy
+  # ----------------------------------------------------------
+  frontend:
+    build: ./frontend
+    networks:
+      - appnet
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    # This is the ONLY service with ports exposed.
+    # "${FRONTEND_PORT:-3000}" means:
+    # - Use FRONTEND_PORT from .env if it exists
+    # - Fall back to 3000 if it doesn't
+    # Format is "HOST_PORT:CONTAINER_PORT"
+    # So traffic hitting your machine on port 3000
+    # gets forwarded into the container on port 3000.
+    environment:
+      - API_URL=http://api:8000
+    # The frontend reaches the API using the service name "api"
+    # on port 8000 — Docker's internal DNS handles this.
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
