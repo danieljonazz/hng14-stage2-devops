@@ -228,9 +228,18 @@ jobs:
             sleep 5
           done
 
-      - name: Submit job and verify completion
+    - name: Submit job and verify completion
         run: |
           echo "Submitting job..."
+          
+          # Show what the frontend returns (without failing on error)
+          echo "--- Frontend response ---"
+          curl -v -X POST http://localhost:3000/submit || true
+          echo "--- Docker logs ---"
+          docker compose logs api
+          docker compose logs frontend
+          docker compose logs worker
+          
           RESPONSE=$(curl -sf -X POST http://localhost:3000/submit)
           echo "Response: $RESPONSE"
           JOB_ID=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
